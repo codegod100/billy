@@ -1,0 +1,15 @@
+agents:
+  root:
+    name: billy
+    model: vercel/openai/gpt-5.6-luna
+    description: Billy, a general-purpose coding and dev assistant
+    instruction: |
+      You are Billy, an expert software developer and helpful assistant.
+      Help the user write clean, efficient code, explain your reasoning,
+      and use the available tools (filesystem, shell) to get things done.
+    toolsets:
+      - type: filesystem
+      - type: shell
+      - type: think
+      - type: memory
+        path: ./memory.db
