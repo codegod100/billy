@@ -142,11 +142,218 @@ function proxyRequest(req, res, extraHeaders) {
   req.pipe(proxyReq);
 }
 
+// ─── A2A REST-binding <-> docker-agent JSON-RPC translation ────────────────
+//
+// docker-agent only implements the A2A *JSON-RPC* transport binding: a
+// single POST /invoke endpoint, method dispatched via a `method` field in
+// the body, lowercase string enums (role: "user", state: "completed"). Some
+// A2A clients (e.g. orchestral) instead speak the REST/HTTP+JSON binding:
+// separate POST {base}/message:send and POST {base}/message:stream
+// endpoints, flat request/response bodies, protobuf-style SCREAMING_SNAKE
+// enums (role: "ROLE_USER", state: "TASK_STATE_COMPLETED") — both are
+// legitimate A2A wire formats for the same protocol, docker-agent just only
+// implemented one of them. These handlers translate REST-binding requests
+// into JSON-RPC calls against the upstream, and translate the JSON-RPC
+// responses back into REST-binding shape.
+
+const ROLE_UPSTREAM_TO_REST = { user: 'ROLE_USER', agent: 'ROLE_AGENT' };
+const ROLE_REST_TO_UPSTREAM = { ROLE_USER: 'user', ROLE_AGENT: 'agent' };
+const STATE_UPSTREAM_TO_REST = {
+  submitted: 'TASK_STATE_SUBMITTED',
+  working: 'TASK_STATE_WORKING',
+  'input-required': 'TASK_STATE_INPUT_REQUIRED',
+  completed: 'TASK_STATE_COMPLETED',
+  failed: 'TASK_STATE_FAILED',
+  canceled: 'TASK_STATE_CANCELED',
+  cancelled: 'TASK_STATE_CANCELED',
+  rejected: 'TASK_STATE_REJECTED',
+  'auth-required': 'TASK_STATE_AUTH_REQUIRED',
+};
+const KIND_TO_REST_KEY = {
+  task: 'task',
+  message: 'message',
+  'status-update': 'statusUpdate',
+  'artifact-update': 'artifactUpdate',
+};
+
+// Recursively rewrite every `role`/`state` value found anywhere in a
+// JSON-RPC result (Task, Message, status/artifact update events all nest
+// these at different depths) into the REST binding's enum spelling.
+function mapEnumsToRest(value) {
+  if (Array.isArray(value)) return value.map(mapEnumsToRest);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'role' && typeof v === 'string' && ROLE_UPSTREAM_TO_REST[v]) {
+        out[k] = ROLE_UPSTREAM_TO_REST[v];
+      } else if (k === 'state' && typeof v === 'string') {
+        out[k] = STATE_UPSTREAM_TO_REST[v] || 'TASK_STATE_UNKNOWN';
+      } else {
+        out[k] = mapEnumsToRest(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function mapMessageToUpstream(message) {
+  if (!message || typeof message !== 'object') return message;
+  const out = { ...message };
+  if (out.role && ROLE_REST_TO_UPSTREAM[out.role]) out.role = ROLE_REST_TO_UPSTREAM[out.role];
+  return out;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+function rpcRequestOptions() {
+  return { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: '/invoke', method: 'POST' };
+}
+
+// Non-streaming JSON-RPC call: buffers and returns the parsed response.
+function rpcCallJson(method, params) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method, params });
+    const proxyReq = http.request(
+      { ...rpcRequestOptions(), headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+      (proxyRes) => {
+        let data = '';
+        proxyRes.on('data', (c) => (data += c));
+        proxyRes.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    proxyReq.on('error', reject);
+    proxyReq.end(body);
+  });
+}
+
+// Streaming JSON-RPC call: resolves with the raw upstream response so the
+// caller can pump SSE chunks as they arrive.
+function rpcCallStream(method, params) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method, params });
+    const proxyReq = http.request(
+      {
+        ...rpcRequestOptions(),
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          'content-length': Buffer.byteLength(body),
+        },
+      },
+      resolve
+    );
+    proxyReq.on('error', reject);
+    proxyReq.end(body);
+  });
+}
+
+async function handleMessageSend(req, res) {
+  const raw = await readBody(req);
+  let request;
+  try {
+    request = JSON.parse(raw);
+  } catch (e) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'invalid JSON body', detail: e.message }));
+  }
+
+  const params = { ...request, message: mapMessageToUpstream(request.message) };
+  let rpcRes;
+  try {
+    rpcRes = await rpcCallJson('message/send', params);
+  } catch (err) {
+    res.writeHead(502, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'upstream unreachable', detail: err.message }));
+  }
+
+  if (rpcRes.error) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: rpcRes.error.message || 'upstream error', detail: rpcRes.error }));
+  }
+
+  const result = mapEnumsToRest(rpcRes.result);
+  const key = KIND_TO_REST_KEY[result.kind] || 'task';
+  res.writeHead(200, { 'content-type': 'application/a2a+json' });
+  res.end(JSON.stringify({ [key]: result }));
+}
+
+async function handleMessageStream(req, res) {
+  const raw = await readBody(req);
+  let request;
+  try {
+    request = JSON.parse(raw);
+  } catch (e) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'invalid JSON body', detail: e.message }));
+  }
+
+  const params = { ...request, message: mapMessageToUpstream(request.message) };
+  let upstreamRes;
+  try {
+    upstreamRes = await rpcCallStream('message/stream', params);
+  } catch (err) {
+    res.writeHead(502, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'upstream unreachable', detail: err.message }));
+  }
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+
+  let buffer = '';
+  upstreamRes.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+    for (const event of events) {
+      for (const line of event.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(line.slice(6));
+        } catch {
+          continue;
+        }
+        if (parsed.error) {
+          res.write(`data: ${JSON.stringify({ error: parsed.error })}\n\n`);
+          continue;
+        }
+        const result = mapEnumsToRest(parsed.result);
+        const key = KIND_TO_REST_KEY[result.kind] || 'task';
+        res.write(`data: ${JSON.stringify({ [key]: result })}\n\n`);
+      }
+    }
+  });
+  upstreamRes.on('end', () => res.end());
+  upstreamRes.on('error', (err) => {
+    res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
+    res.end();
+  });
+}
+
 async function serveAgentCard(req, res) {
   try {
     const card = await fetchLocalJson(`http://${UPSTREAM_HOST}:${UPSTREAM_PORT}${AGENT_CARD_PATH}`);
     if (PUBLIC_URL) {
-      card.url = `${PUBLIC_URL.replace(/\/$/, '')}/invoke`;
+      // Bare base, not .../invoke — REST-binding clients (e.g. orchestral)
+      // append /message:send and /message:stream directly onto this url.
+      card.url = PUBLIC_URL.replace(/\/$/, '');
     }
     // A2A's SecurityScheme is a protobuf oneof — in JSON that's a nested
     // wrapper key per scheme type (openIdConnectSecurityScheme, etc.), not
@@ -209,6 +416,13 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer error="invalid_token"' });
     return res.end(JSON.stringify({ error: 'invalid token', detail: err.message }));
+  }
+
+  if (path === '/message:send' && req.method === 'POST') {
+    return handleMessageSend(req, res);
+  }
+  if (path === '/message:stream' && req.method === 'POST') {
+    return handleMessageStream(req, res);
   }
 
   proxyRequest(req, res, { 'x-oidc-subject': claims.sub || '', 'x-oidc-email': claims.email || '' });
