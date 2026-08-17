@@ -1,4 +1,4 @@
-FROM docker/cagent:latest
+FROM docker/docker-agent:latest
 
 COPY agent.yaml /work/agent.yaml
 
