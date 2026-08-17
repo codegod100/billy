@@ -148,11 +148,17 @@ async function serveAgentCard(req, res) {
     if (PUBLIC_URL) {
       card.url = `${PUBLIC_URL.replace(/\/$/, '')}/invoke`;
     }
+    // A2A's SecurityScheme is a protobuf oneof — in JSON that's a nested
+    // wrapper key per scheme type (openIdConnectSecurityScheme, etc.), not
+    // a flat {type, ...} object. And openIdConnectUrl is the bare issuer;
+    // OIDC clients append /.well-known/openid-configuration themselves.
     card.securitySchemes = {
       ...(card.securitySchemes || {}),
       'pocket-id-oidc': {
-        type: 'openIdConnect',
-        openIdConnectUrl: `${ISSUER}/.well-known/openid-configuration`,
+        openIdConnectSecurityScheme: {
+          type: 'openIdConnect',
+          openIdConnectUrl: ISSUER,
+        },
       },
     };
     card.security = [{ 'pocket-id-oidc': [] }];
