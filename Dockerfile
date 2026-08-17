@@ -1,6 +1,13 @@
 FROM docker/docker-agent:latest
 
-COPY agent.yaml /work/agent.yaml
+USER root
+RUN apk add --no-cache nodejs
 
-ENTRYPOINT []
-CMD ["/bin/sh", "-c", "/docker-agent serve chat /work/agent.yaml --listen 0.0.0.0:${PORT:-8080} --api-key-env CHAT_API_KEY"]
+COPY agent.yaml /work/agent.yaml
+COPY oidc-proxy.js /oidc-proxy.js
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh \
+    && chown docker-agent:docker-agent /work/agent.yaml /oidc-proxy.js /docker-entrypoint.sh
+
+USER docker-agent
+ENTRYPOINT ["/docker-entrypoint.sh"]
