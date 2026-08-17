@@ -1,0 +1,13 @@
+FROM docker/docker-agent:latest
+
+USER root
+RUN apk add --no-cache nodejs
+
+COPY agent.yaml /work/agent.yaml
+COPY oidc-proxy.js /oidc-proxy.js
+COPY docker-entrypoint-a2a.sh /docker-entrypoint-a2a.sh
+RUN chmod +x /docker-entrypoint-a2a.sh \
+    && chown docker-agent:docker-agent /work/agent.yaml /oidc-proxy.js /docker-entrypoint-a2a.sh
+
+USER docker-agent
+ENTRYPOINT ["/docker-entrypoint-a2a.sh"]
